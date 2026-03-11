@@ -1,0 +1,6 @@
+MAIN
+
+python main.py --device cuda --steps 40000 --log-every 100 --checkpoint checkpoints/run_2000_2008.pt
+
+EVAL
+python eval.py --device cpu --checkpoint checkpoints/run_2000_2008.pt  --out-csv checkpoints/eval.csv
