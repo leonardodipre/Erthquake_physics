@@ -1,0 +1,28 @@
+{
+  "utm_epsg": 32633,
+  "nx": 87,
+  "ny": 22,
+  "Nc": 1914,
+  "fault_meta": {
+    "strike_deg": 132.5,
+    "dip_deg": 52.5,
+    "rake_deg": 270.0,
+    "top_depth_m": 1000.0,
+    "bottom_depth_m": 14000.0,
+    "length_m": 65117.84190262422,
+    "width_m": 16386.14138213344,
+    "origin_en": [
+      396566.846537464,
+      4677934.056094231
+    ]
+  },
+  "elastic": {
+    "nu": 0.25,
+    "mu": 30000000000.0
+  },
+  "notes": {
+    "K_ij_units": "Pa per meter of slip",
+    "K_cd_units": "m per meter of slip",
+    "K_cd_row_order": "[E1,N1,U1,E2,N2,U2,...]"
+  }
+}
