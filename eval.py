@@ -8,8 +8,10 @@ import numpy as np
 import pandas as pd
 import torch
 
-from dataset import PINNDataloader
+from dataset import PINNDataloader, list_markers_in_subdir
 from predict import load_trained_model
+
+SECONDS_PER_DAY = 86_400.0
 
 
 def _as_path(path_like: str | Path) -> Path:
@@ -34,6 +36,15 @@ def _masked_metrics(residual: np.ndarray, mask: np.ndarray) -> dict[str, float]:
         "mae_m": float(np.mean(np.abs(residual_valid))),
         "max_abs_m": float(np.max(np.abs(residual_valid))),
     }
+
+
+def _resolve_excluded_markers(cfg: dict[str, Any], data_dir: str) -> list[str]:
+    explicit = [str(marker).strip().upper() for marker in cfg.get("excluded_markers", ()) if str(marker).strip()]
+    by_subdir = []
+    subdir = cfg.get("excluded_markers_subdir")
+    if subdir:
+        by_subdir = list_markers_in_subdir(data_dir=data_dir, subdir=str(subdir))
+    return sorted(dict.fromkeys(explicit + by_subdir))
 
 
 def evaluate_gnss_misfit(
@@ -62,6 +73,17 @@ def evaluate_gnss_misfit(
         time_domain_physics=cfg["time_domain_physics"],
         reference_date=str(cfg["reference_date"]),
         seed=cfg.get("seed"),
+        gap_min_days=float(cfg.get("gap_min_days", 0.5)),
+        gap_max_days=float(cfg.get("gap_max_days", 1.5)),
+        apply_robust_filter=bool(cfg.get("apply_robust_filter", True)),
+        mad_scale=float(cfg.get("mad_scale", 1.4826)),
+        mad_sigma_threshold=float(cfg.get("mad_sigma_threshold", 8.0)),
+        inversion_sigma_threshold=float(cfg.get("inversion_sigma_threshold", 6.0)),
+        inversion_ratio_min=float(cfg.get("inversion_ratio_min", 0.6)),
+        inversion_cancellation_max=float(cfg.get("inversion_cancellation_max", 0.45)),
+        slope_window_days=float(cfg.get("slope_window_days", 14.0)),
+        slope_min_points=int(cfg.get("slope_min_points", 10)),
+        excluded_markers=_resolve_excluded_markers(cfg=cfg, data_dir=data_dir),
     )
 
     data_indices = dataloader.data_indices
@@ -69,9 +91,12 @@ def evaluate_gnss_misfit(
         data_indices = data_indices[: int(max_samples)]
 
     rows: list[dict[str, Any]] = []
-    weighted_sse = 0.0
-    weighted_abs = 0.0
-    total_valid = 0.0
+    weighted_position_sse = 0.0
+    weighted_position_abs = 0.0
+    total_valid_position = 0.0
+    weighted_velocity_sse = 0.0
+    weighted_velocity_abs = 0.0
+    total_valid_velocity = 0.0
 
     print(
         f"Eval start | device={device_t} | checkpoint={checkpoint_path} | "
@@ -84,32 +109,51 @@ def evaluate_gnss_misfit(
         timestamp = pd.Timestamp(dataloader.timestamps[row_idx])
         u_obs = dataloader.u_observed[row_idx].to(device=device_t, non_blocking=True)
         mask = dataloader.mask_data[row_idx].to(device=device_t, non_blocking=True)
+        v_obs = dataloader.v_observed[row_idx].to(device=device_t, non_blocking=True)
+        velocity_mask = dataloader.mask_velocity[row_idx].to(device=device_t, non_blocking=True)
 
         with torch.enable_grad():
             out = model(xi, eta, t_seconds)
 
-        residual = ((out["u_surface"] - u_obs) * mask).detach().cpu().numpy()
-        mask_np = mask.detach().cpu().numpy()
-        metrics = _masked_metrics(residual=residual, mask=mask_np)
+        residual_position = ((out["u_surface"] - u_obs) * mask).detach().cpu().numpy()
+        position_mask_np = mask.detach().cpu().numpy()
+        position_metrics = _masked_metrics(residual=residual_position, mask=position_mask_np)
 
-        valid = metrics["n_valid_components"]
-        weighted_sse += (metrics["rmse_m"] ** 2) * valid
-        weighted_abs += metrics["mae_m"] * valid
-        total_valid += valid
+        residual_velocity = ((out["v_surface"] - v_obs) * velocity_mask).detach().cpu().numpy()
+        velocity_mask_np = velocity_mask.detach().cpu().numpy()
+        velocity_metrics = _masked_metrics(residual=residual_velocity, mask=velocity_mask_np)
+
+        valid_position = position_metrics["n_valid_components"]
+        weighted_position_sse += (position_metrics["rmse_m"] ** 2) * valid_position
+        weighted_position_abs += position_metrics["mae_m"] * valid_position
+        total_valid_position += valid_position
+
+        valid_velocity = velocity_metrics["n_valid_components"]
+        weighted_velocity_sse += (velocity_metrics["rmse_m"] ** 2) * valid_velocity
+        weighted_velocity_abs += velocity_metrics["mae_m"] * valid_velocity
+        total_valid_velocity += valid_velocity
 
         rows.append(
             {
                 "index": int(row_idx),
                 "date": timestamp.isoformat(),
                 "time_seconds": t_seconds,
-                "n_valid_components": int(valid),
-                "n_valid_stations": int(valid // 3),
-                "rmse_m": metrics["rmse_m"],
-                "rmse_mm": metrics["rmse_m"] * 1e3,
-                "mae_m": metrics["mae_m"],
-                "mae_mm": metrics["mae_m"] * 1e3,
-                "max_abs_m": metrics["max_abs_m"],
-                "max_abs_mm": metrics["max_abs_m"] * 1e3,
+                "n_valid_components": int(valid_position),
+                "n_valid_stations": int(valid_position // 3),
+                "rmse_m": position_metrics["rmse_m"],
+                "rmse_mm": position_metrics["rmse_m"] * 1e3,
+                "mae_m": position_metrics["mae_m"],
+                "mae_mm": position_metrics["mae_m"] * 1e3,
+                "max_abs_m": position_metrics["max_abs_m"],
+                "max_abs_mm": position_metrics["max_abs_m"] * 1e3,
+                "n_valid_velocity_components": int(valid_velocity),
+                "n_valid_velocity_stations": int(valid_velocity // 3),
+                "velocity_rmse_m_per_s": velocity_metrics["rmse_m"],
+                "velocity_rmse_mm_per_day": velocity_metrics["rmse_m"] * 1e3 * SECONDS_PER_DAY,
+                "velocity_mae_m_per_s": velocity_metrics["mae_m"],
+                "velocity_mae_mm_per_day": velocity_metrics["mae_m"] * 1e3 * SECONDS_PER_DAY,
+                "velocity_max_abs_m_per_s": velocity_metrics["max_abs_m"],
+                "velocity_max_abs_mm_per_day": velocity_metrics["max_abs_m"] * 1e3 * SECONDS_PER_DAY,
             }
         )
 
@@ -117,15 +161,22 @@ def evaluate_gnss_misfit(
             print(
                 f"Eval {eval_idx:5d}/{len(data_indices):5d} | "
                 f"date={timestamp.date()} | "
-                f"rmse_mm={metrics['rmse_m'] * 1e3:.3f} | "
-                f"mae_mm={metrics['mae_m'] * 1e3:.3f} | "
-                f"valid_comp={int(valid)}",
+                f"rmse_mm={position_metrics['rmse_m'] * 1e3:.3f} | "
+                f"vel_rmse_mm_day={velocity_metrics['rmse_m'] * 1e3 * SECONDS_PER_DAY:.3f} | "
+                f"valid_comp={int(valid_position)} | "
+                f"valid_vel={int(valid_velocity)}",
                 flush=True,
             )
 
     results_df = pd.DataFrame(rows)
-    global_rmse_m = float(np.sqrt(weighted_sse / max(total_valid, 1.0)))
-    global_mae_m = float(weighted_abs / max(total_valid, 1.0))
+    global_rmse_m = float(np.sqrt(weighted_position_sse / max(total_valid_position, 1.0)))
+    global_mae_m = float(weighted_position_abs / max(total_valid_position, 1.0))
+    global_velocity_rmse_m_per_s = float(
+        np.sqrt(weighted_velocity_sse / max(total_valid_velocity, 1.0))
+    )
+    global_velocity_mae_m_per_s = float(
+        weighted_velocity_abs / max(total_valid_velocity, 1.0)
+    )
 
     summary = {
         "n_time_samples": int(len(results_df)),
@@ -133,16 +184,36 @@ def evaluate_gnss_misfit(
             results_df["date"].iloc[0] if not results_df.empty else None,
             results_df["date"].iloc[-1] if not results_df.empty else None,
         ),
-        "total_valid_components": int(total_valid),
+        "total_valid_components": int(total_valid_position),
+        "total_valid_velocity_components": int(total_valid_velocity),
         "global_rmse_m": global_rmse_m,
         "global_rmse_mm": global_rmse_m * 1e3,
         "global_mae_m": global_mae_m,
         "global_mae_mm": global_mae_m * 1e3,
+        "global_velocity_rmse_m_per_s": global_velocity_rmse_m_per_s,
+        "global_velocity_rmse_mm_per_day": global_velocity_rmse_m_per_s * 1e3 * SECONDS_PER_DAY,
+        "global_velocity_mae_m_per_s": global_velocity_mae_m_per_s,
+        "global_velocity_mae_mm_per_day": global_velocity_mae_m_per_s * 1e3 * SECONDS_PER_DAY,
         "median_time_rmse_mm": float(results_df["rmse_mm"].median()) if not results_df.empty else 0.0,
         "p90_time_rmse_mm": float(results_df["rmse_mm"].quantile(0.90)) if not results_df.empty else 0.0,
         "worst_time_rmse_mm": float(results_df["rmse_mm"].max()) if not results_df.empty else 0.0,
+        "median_time_velocity_rmse_mm_per_day": (
+            float(results_df["velocity_rmse_mm_per_day"].median()) if not results_df.empty else 0.0
+        ),
+        "p90_time_velocity_rmse_mm_per_day": (
+            float(results_df["velocity_rmse_mm_per_day"].quantile(0.90)) if not results_df.empty else 0.0
+        ),
+        "worst_time_velocity_rmse_mm_per_day": (
+            float(results_df["velocity_rmse_mm_per_day"].max()) if not results_df.empty else 0.0
+        ),
         "mean_valid_stations": float(results_df["n_valid_stations"].mean()) if not results_df.empty else 0.0,
         "median_valid_stations": float(results_df["n_valid_stations"].median()) if not results_df.empty else 0.0,
+        "mean_valid_velocity_stations": (
+            float(results_df["n_valid_velocity_stations"].mean()) if not results_df.empty else 0.0
+        ),
+        "median_valid_velocity_stations": (
+            float(results_df["n_valid_velocity_stations"].median()) if not results_df.empty else 0.0
+        ),
     }
 
     if output_csv is not None:

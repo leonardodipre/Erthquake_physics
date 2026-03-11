@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from config import DEFAULT_CONFIG
-from dataset import PINNDataloader
+from dataset import PINNDataloader, list_markers_in_subdir
 from fault import load_fault_coordinates
 from loss import PINNLoss
 from model import HybridPINN, load_green_matrices
@@ -22,6 +22,15 @@ def _resolve_device(device: torch.device | str | None) -> torch.device:
     if device is None:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device)
+
+
+def _resolve_excluded_markers(cfg: Mapping[str, Any], data_dir: str) -> list[str]:
+    explicit = [str(marker).strip().upper() for marker in cfg.get("excluded_markers", ()) if str(marker).strip()]
+    by_subdir = []
+    subdir = cfg.get("excluded_markers_subdir")
+    if subdir:
+        by_subdir = list_markers_in_subdir(data_dir=data_dir, subdir=str(subdir))
+    return sorted(dict.fromkeys(explicit + by_subdir))
 
 
 def _prepare_runtime(
@@ -87,7 +96,9 @@ def _log_device_state(
     xi: torch.Tensor,
     eta: torch.Tensor,
     u_obs: torch.Tensor,
+    v_obs: torch.Tensor,
     mask: torch.Tensor,
+    velocity_mask: torch.Tensor,
     out_data: dict[str, torch.Tensor],
 ) -> None:
     first_param = next(model.parameters())
@@ -99,8 +110,11 @@ def _log_device_state(
         f"xi={xi.device} | "
         f"eta={eta.device} | "
         f"u_obs={u_obs.device} | "
+        f"v_obs={v_obs.device} | "
         f"mask={mask.device} | "
+        f"mask_v={velocity_mask.device} | "
         f"u_surface={out_data['u_surface'].device} | "
+        f"v_surface={out_data['v_surface'].device} | "
         f"s={out_data['s'].device}",
         flush=True,
     )
@@ -118,6 +132,8 @@ def train_pinn(
         cfg.update(dict(config))
 
     device = _resolve_device(device)
+    excluded_markers = _resolve_excluded_markers(cfg=cfg, data_dir=data_dir)
+    cfg["excluded_markers"] = list(excluded_markers)
     print("We are on device", device)
     if cfg.get("seed") is not None:
         np.random.seed(int(cfg["seed"]))
@@ -137,11 +153,30 @@ def train_pinn(
         time_domain_physics=cfg["time_domain_physics"],
         reference_date=str(cfg["reference_date"]),
         seed=cfg.get("seed"),
+        gap_min_days=float(cfg.get("gap_min_days", 0.5)),
+        gap_max_days=float(cfg.get("gap_max_days", 1.5)),
+        apply_robust_filter=bool(cfg.get("apply_robust_filter", True)),
+        mad_scale=float(cfg.get("mad_scale", 1.4826)),
+        mad_sigma_threshold=float(cfg.get("mad_sigma_threshold", 8.0)),
+        inversion_sigma_threshold=float(cfg.get("inversion_sigma_threshold", 6.0)),
+        inversion_ratio_min=float(cfg.get("inversion_ratio_min", 0.6)),
+        inversion_cancellation_max=float(cfg.get("inversion_cancellation_max", 0.45)),
+        slope_window_days=float(cfg.get("slope_window_days", 14.0)),
+        slope_min_points=int(cfg.get("slope_min_points", 10)),
+        excluded_markers=excluded_markers,
     )
 
     pinn = _build_model(cfg=cfg, K_cd=K_cd, K_ij=K_ij, n_patches=n_patches, device=device)
 
-    losses = PINNLoss(neighbors=neighbors, sigma_n=pinn.sigma_n)
+    losses = PINNLoss(
+        neighbors=neighbors,
+        sigma_n=pinn.sigma_n,
+        surface_velocity_scale=float(cfg.get("surface_velocity_scale", 1e-10)),
+        position_huber_beta=float(cfg.get("position_huber_beta", 5e-3)),
+        velocity_huber_beta=float(cfg.get("velocity_huber_beta", 1.0)),
+        position_component_weights=tuple(cfg.get("position_component_weights", (1.0, 1.0, 1.0))),
+        velocity_component_weights=tuple(cfg.get("velocity_component_weights", (1.0, 1.0, 1.0))),
+    )
     optimizer = torch.optim.AdamW(
         pinn.parameters(),
         lr=float(cfg["lr"]),
@@ -164,35 +199,73 @@ def train_pinn(
         f"log_every={log_every} | checkpoint={checkpoint}",
         flush=True,
     )
+    if excluded_markers:
+        print(
+            f"Holdout stations excluded from train: {', '.join(excluded_markers)}",
+            flush=True,
+        )
+    print(
+        "Dataset filter | "
+        f"pos_valid={dataloader.filter_report['position_valid_fraction']:.3f} | "
+        f"vel_valid={dataloader.filter_report['velocity_valid_fraction']:.3f} | "
+        f"robust_excluded={dataloader.filter_report['robust_excluded_fraction']:.3f}",
+        flush=True,
+    )
 
     for step in range(total_steps):
         optimizer.zero_grad(set_to_none=True)
 
         data_samples = dataloader.sample_data_batch(batch_size=int(cfg["data_batch_size"]))
-        L_data = torch.zeros((), dtype=torch.float32, device=device)
+        L_position = torch.zeros((), dtype=torch.float32, device=device)
+        L_velocity = torch.zeros((), dtype=torch.float32, device=device)
         out_data: dict[str, torch.Tensor] | None = None
         batch_u_obs_device: torch.Tensor | None = None
+        batch_v_obs_device: torch.Tensor | None = None
         batch_mask_device: torch.Tensor | None = None
+        batch_velocity_mask_device: torch.Tensor | None = None
         for sample in data_samples:
             u_obs_device = sample["u_observed"].to(device=device, non_blocking=True)
+            v_obs_device = sample["v_observed"].to(device=device, non_blocking=True)
             mask_device = sample["mask_data"].to(device=device, non_blocking=True)
+            velocity_mask_device = sample["mask_velocity"].to(device=device, non_blocking=True)
             out_data = pinn(xi, eta, sample["t_seconds"])
-            L_data = L_data + losses.data(
+            L_position = L_position + losses.data(
                 u_pred=out_data["u_surface"],
                 u_obs=u_obs_device,
                 mask=mask_device,
             )
+            L_velocity = L_velocity + losses.velocity(
+                v_pred=out_data["v_surface"],
+                v_obs=v_obs_device,
+                mask=velocity_mask_device,
+            )
             batch_u_obs_device = u_obs_device
+            batch_v_obs_device = v_obs_device
             batch_mask_device = mask_device
-        L_data = L_data / max(len(data_samples), 1)
+            batch_velocity_mask_device = velocity_mask_device
+        L_position = L_position / max(len(data_samples), 1)
+        L_velocity = L_velocity / max(len(data_samples), 1)
+        L_data = (
+            float(cfg.get("lambda_data_position", 1.0)) * L_position
+            + float(cfg.get("lambda_data_velocity", 1.0)) * L_velocity
+        )
 
-        if step == 0 and out_data is not None and batch_u_obs_device is not None and batch_mask_device is not None:
+        if (
+            step == 0
+            and out_data is not None
+            and batch_u_obs_device is not None
+            and batch_v_obs_device is not None
+            and batch_mask_device is not None
+            and batch_velocity_mask_device is not None
+        ):
             _log_device_state(
                 model=pinn,
                 xi=xi,
                 eta=eta,
                 u_obs=batch_u_obs_device,
+                v_obs=batch_v_obs_device,
                 mask=batch_mask_device,
+                velocity_mask=batch_velocity_mask_device,
                 out_data=out_data,
             )
 
@@ -244,6 +317,8 @@ def train_pinn(
                     "step": float(step),
                     "L_total": float(L_total.detach().cpu()),
                     "L_data": float(L_data.detach().cpu()),
+                    "L_position": float(L_position.detach().cpu()),
+                    "L_velocity": float(L_velocity.detach().cpu()),
                     "L_rsf": float(L_rsf.detach().cpu()),
                     "L_state": float(L_state.detach().cpu()),
                     "L_smooth": float(L_smooth.detach().cpu()),
@@ -256,6 +331,8 @@ def train_pinn(
                 print(
                     f"Step {step + 1:5d}/{total_steps:5d} | "
                     f"L_tot={log_entry['L_total']:.2e} | "
+                    f"L_pos={log_entry['L_position']:.2e} | "
+                    f"L_vel={log_entry['L_velocity']:.2e} | "
                     f"L_data={log_entry['L_data']:.2e} | "
                     f"L_rsf={log_entry['L_rsf']:.2e} | "
                     f"L_state={log_entry['L_state']:.2e} | "

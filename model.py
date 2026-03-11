@@ -184,6 +184,7 @@ class HybridPINN(nn.Module):
         )[0].unsqueeze(-1)
 
         u_surface = self.K_cd @ slip.squeeze(-1)
+        v_surface = self.K_cd @ V.squeeze(-1)
         tau_interaction = self.K_ij @ slip.squeeze(-1)
         tau_elastic = (
             self.tau_0.to(device=device, dtype=dtype)
@@ -204,6 +205,7 @@ class HybridPINN(nn.Module):
 
         return {
             "u_surface": u_surface,
+            "v_surface": v_surface,
             "s": slip,
             "V": V,
             "theta": theta,

@@ -10,6 +10,8 @@ import torch
 DEFAULT_DATA_SUBDIRS = ("modified", "accepted", "acc_test")
 DEFAULT_OBS_COLS = ("E_clean", "N_clean", "U_clean")
 FALLBACK_OBS_COLS = ("E", "N", "U")
+COMPONENTS = ("E", "N", "U")
+SECONDS_PER_DAY = 86_400.0
 
 
 def _as_path(path_like: str | Path) -> Path:
@@ -18,6 +20,22 @@ def _as_path(path_like: str | Path) -> Path:
 
 def _is_year_like(value: Any) -> bool:
     return isinstance(value, (int, float, np.integer, np.floating))
+
+
+def extract_marker_from_filename(path_like: str | Path) -> str:
+    path = _as_path(path_like)
+    parts = path.stem.split("_")
+    if len(parts) < 2:
+        raise ValueError(f"Cannot extract marker from filename: {path}")
+    return parts[1].strip().upper()
+
+
+def list_markers_in_subdir(data_dir: str | Path, subdir: str) -> list[str]:
+    folder = _as_path(data_dir) / subdir
+    if not folder.exists():
+        return []
+    markers = [extract_marker_from_filename(csv_path) for csv_path in sorted(folder.glob("*.csv"))]
+    return sorted(dict.fromkeys(markers))
 
 
 class PINNDataloader:
@@ -30,17 +48,69 @@ class PINNDataloader:
         reference_date: str = "2000-01-01",
         data_subdirs: Sequence[str] = DEFAULT_DATA_SUBDIRS,
         seed: int | None = None,
+        gap_min_days: float = 0.5,
+        gap_max_days: float = 1.5,
+        apply_robust_filter: bool = True,
+        mad_scale: float = 1.4826,
+        mad_sigma_threshold: float = 8.0,
+        inversion_sigma_threshold: float = 6.0,
+        inversion_ratio_min: float = 0.6,
+        inversion_cancellation_max: float = 0.45,
+        slope_window_days: float = 14.0,
+        slope_min_points: int = 10,
+        excluded_markers: Sequence[str] | None = None,
     ) -> None:
         self.data_dir = _as_path(data_dir)
         self.station_order = np.load(_as_path(station_ids_path), allow_pickle=True).tolist()
+        self.station_order = [str(marker).strip().upper() for marker in self.station_order]
+        self.station_index = {marker: idx for idx, marker in enumerate(self.station_order)}
         self.reference_date = pd.Timestamp(reference_date)
         self.rng = np.random.default_rng(seed)
         self.data_subdirs = tuple(data_subdirs)
+        self.excluded_markers = sorted(
+            marker for marker in {str(m).strip().upper() for m in (excluded_markers or ())} if marker
+        )
+
+        self.gap_min_days = float(gap_min_days)
+        self.gap_max_days = float(gap_max_days)
+        if self.gap_min_days <= 0.0:
+            raise ValueError("gap_min_days must be strictly positive.")
+        if self.gap_max_days < self.gap_min_days:
+            raise ValueError("gap_max_days must be >= gap_min_days.")
+
+        self.apply_robust_filter = bool(apply_robust_filter)
+        self.mad_scale = float(mad_scale)
+        self.mad_sigma_threshold = float(mad_sigma_threshold)
+        self.inversion_sigma_threshold = float(inversion_sigma_threshold)
+        self.inversion_ratio_min = float(inversion_ratio_min)
+        self.inversion_cancellation_max = float(inversion_cancellation_max)
+        self.slope_window_days = float(slope_window_days)
+        self.slope_min_points = int(slope_min_points)
+        if self.slope_window_days <= 0.0:
+            raise ValueError("slope_window_days must be strictly positive.")
+        if self.slope_min_points < 2:
+            raise ValueError("slope_min_points must be >= 2.")
 
         self.station_files = self._select_station_files()
-        self.timestamps, u_obs, masks = self._build_dense_observation_matrices()
+        (
+            self.timestamps,
+            u_obs,
+            position_masks,
+            v_obs,
+            velocity_masks,
+            filter_report,
+        ) = self._build_dense_observation_matrices()
         self.u_observed = torch.from_numpy(u_obs)
-        self.mask_data = torch.from_numpy(masks)
+        self.mask_data = torch.from_numpy(position_masks)
+        self.v_observed = torch.from_numpy(v_obs)
+        self.mask_velocity = torch.from_numpy(velocity_masks)
+        self.filter_report = filter_report
+        self.training_component_mask = self.build_component_mask(
+            [marker for marker in self.station_order if marker not in set(self.excluded_markers)]
+        )
+        self.holdout_component_mask = self.build_component_mask(self.excluded_markers)
+        self.filter_report["n_excluded_stations"] = len(self.excluded_markers)
+        self.filter_report["excluded_markers"] = list(self.excluded_markers)
         self.time_seconds = torch.tensor(
             (self.timestamps - self.reference_date).total_seconds().to_numpy(),
             dtype=torch.float32,
@@ -62,7 +132,7 @@ class PINNDataloader:
             if not folder.exists():
                 continue
             for csv_path in sorted(folder.glob("*.csv")):
-                marker = csv_path.name.split("_")[1]
+                marker = extract_marker_from_filename(csv_path)
                 if marker in station_set and marker not in selected:
                     selected[marker] = str(csv_path)
         missing = sorted(station_set - set(selected))
@@ -80,6 +150,7 @@ class PINNDataloader:
             component_cols = FALLBACK_OBS_COLS
         else:
             raise ValueError(f"Unexpected columns in {csv_path}")
+
         out = df.loc[:, ["date", *component_cols]].copy()
         out.columns = ["date", "E", "N", "U"]
         out["date"] = pd.to_datetime(out["date"])
@@ -87,31 +158,203 @@ class PINNDataloader:
         out = out.sort_values("date", kind="stable").reset_index(drop=True)
         return out
 
-    def _build_dense_observation_matrices(self) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
+    def _robust_center_sigma(self, values: np.ndarray) -> tuple[float, float]:
+        if values.size == 0:
+            return 0.0, 1.0
+        center = float(np.median(values))
+        mad = float(np.median(np.abs(values - center)))
+        sigma = self.mad_scale * mad
+        if not np.isfinite(sigma) or sigma <= 0.0:
+            sigma = float(np.std(values))
+        if not np.isfinite(sigma) or sigma <= 0.0:
+            sigma = 1.0
+        return center, sigma
+
+    def _windowed_slopes_m_per_s(
+        self,
+        t_days: np.ndarray,
+        values: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if values.ndim != 2 or values.shape[1] != len(COMPONENTS):
+            raise ValueError("values must have shape (n_samples, 3).")
+
+        half_window_days = 0.5 * self.slope_window_days
+        left_idx = np.searchsorted(t_days, t_days - half_window_days, side="left")
+        right_idx = np.searchsorted(t_days, t_days + half_window_days, side="right")
+        n_window = right_idx - left_idx
+
+        prefix_t = np.concatenate(([0.0], np.cumsum(t_days, dtype=np.float64)))
+        prefix_t2 = np.concatenate(([0.0], np.cumsum(t_days * t_days, dtype=np.float64)))
+        sum_t = prefix_t[right_idx] - prefix_t[left_idx]
+        sum_t2 = prefix_t2[right_idx] - prefix_t2[left_idx]
+
+        denom = n_window * sum_t2 - sum_t * sum_t
+        valid = (n_window >= self.slope_min_points) & (np.abs(denom) > 1e-20)
+        safe_denom = np.where(valid, denom, 1.0)
+
+        slopes = np.full(values.shape, np.nan, dtype=np.float64)
+        for comp_idx in range(values.shape[1]):
+            comp = values[:, comp_idx].astype(np.float64, copy=False)
+            prefix_comp = np.concatenate(([0.0], np.cumsum(comp, dtype=np.float64)))
+            prefix_t_comp = np.concatenate(([0.0], np.cumsum(t_days * comp, dtype=np.float64)))
+
+            sum_comp = prefix_comp[right_idx] - prefix_comp[left_idx]
+            sum_t_comp = prefix_t_comp[right_idx] - prefix_t_comp[left_idx]
+
+            slope_m_per_day = (n_window * sum_t_comp - sum_t * sum_comp) / safe_denom
+            slopes[:, comp_idx] = np.where(valid, slope_m_per_day / SECONDS_PER_DAY, np.nan)
+
+        return slopes.astype(np.float32), valid
+
+    def _robust_flags(self, values: np.ndarray, valid_rows: np.ndarray) -> np.ndarray:
+        flags = np.zeros(values.shape[0], dtype=bool)
+        if not self.apply_robust_filter or not valid_rows.any():
+            return flags
+
+        valid_values = values[valid_rows]
+        center, sigma = self._robust_center_sigma(valid_values)
+        centered = values - center
+
+        flags |= valid_rows & (np.abs(centered) > self.mad_sigma_threshold * sigma)
+
+        pair_idx = np.flatnonzero(valid_rows[:-1] & valid_rows[1:])
+        if pair_idx.size == 0:
+            return flags
+
+        left = centered[pair_idx]
+        right = centered[pair_idx + 1]
+        abs_left = np.abs(left)
+        abs_right = np.abs(right)
+        max_abs = np.maximum(abs_left, abs_right)
+        min_abs = np.minimum(abs_left, abs_right)
+        ratio = min_abs / np.maximum(max_abs, 1e-12)
+        cancellation = np.abs(left + right) / np.maximum(max_abs, 1e-12)
+
+        inverted = (
+            (left * right < 0.0)
+            & (abs_left >= self.inversion_sigma_threshold * sigma)
+            & (abs_right >= self.inversion_sigma_threshold * sigma)
+            & (ratio >= self.inversion_ratio_min)
+            & (cancellation <= self.inversion_cancellation_max)
+        )
+        flagged_pairs = pair_idx[inverted]
+        flags[flagged_pairs] = True
+        flags[flagged_pairs + 1] = True
+        return flags
+
+    def _prepare_station_frame(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
+        out = frame.copy()
+        values = out.loc[:, list(COMPONENTS)].to_numpy(dtype=np.float64, copy=True)
+        finite_positions = np.isfinite(values)
+        values = np.nan_to_num(values, nan=0.0)
+
+        t_days = (
+            (out["date"] - out["date"].iloc[0]).dt.total_seconds().to_numpy(dtype=np.float64)
+            / SECONDS_PER_DAY
+        )
+        slopes_m_per_s, slope_window_valid = self._windowed_slopes_m_per_s(t_days=t_days, values=values)
+        velocity_base_mask = slope_window_valid[:, None] & np.isfinite(slopes_m_per_s)
+
+        robust_flags = np.zeros_like(velocity_base_mask, dtype=bool)
+        for comp_idx in range(len(COMPONENTS)):
+            robust_flags[:, comp_idx] = self._robust_flags(
+                values=slopes_m_per_s[:, comp_idx],
+                valid_rows=velocity_base_mask[:, comp_idx],
+            )
+
+        position_mask = finite_positions & ~robust_flags
+        velocity_mask = velocity_base_mask & ~robust_flags
+
+        for comp_idx, component in enumerate(COMPONENTS):
+            out[component] = values[:, comp_idx].astype(np.float32)
+            out[f"v{component}_slope"] = np.nan_to_num(
+                slopes_m_per_s[:, comp_idx], nan=0.0
+            ).astype(np.float32)
+            out[f"mask_pos_{component}"] = position_mask[:, comp_idx].astype(np.float32)
+            out[f"mask_vel_{component}"] = velocity_mask[:, comp_idx].astype(np.float32)
+            out[f"flag_robust_{component}"] = robust_flags[:, comp_idx].astype(np.float32)
+
+        report = {
+            "position_total_components": int(finite_positions.sum()),
+            "position_valid_components": int(position_mask.sum()),
+            "velocity_base_components": int(velocity_base_mask.sum()),
+            "velocity_valid_components": int(velocity_mask.sum()),
+            "robust_excluded_components": int(robust_flags.sum()),
+        }
+        return out, report
+
+    def _build_dense_observation_matrices(
+        self,
+    ) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float | int]]:
         station_frames: dict[str, pd.DataFrame] = {}
+        filter_reports: list[dict[str, int]] = []
         date_series = []
         for marker in self.station_order:
-            frame = self._read_station_frame(self.station_files[marker])
-            station_frames[marker] = frame
-            date_series.append(frame["date"])
+            raw_frame = self._read_station_frame(self.station_files[marker])
+            processed_frame, report = self._prepare_station_frame(raw_frame)
+            station_frames[marker] = processed_frame
+            filter_reports.append(report)
+            date_series.append(processed_frame["date"])
 
         timestamps = pd.DatetimeIndex(sorted(set(pd.concat(date_series).tolist())))
         n_times = len(timestamps)
         n_obs = 3 * len(self.station_order)
         u_obs = np.zeros((n_times, n_obs), dtype=np.float32)
-        masks = np.zeros((n_times, n_obs), dtype=np.float32)
+        position_masks = np.zeros((n_times, n_obs), dtype=np.float32)
+        v_obs = np.zeros((n_times, n_obs), dtype=np.float32)
+        velocity_masks = np.zeros((n_times, n_obs), dtype=np.float32)
         time_to_row = {ts: idx for idx, ts in enumerate(timestamps)}
 
         for station_idx, marker in enumerate(self.station_order):
             frame = station_frames[marker]
             row_idx = np.fromiter((time_to_row[ts] for ts in frame["date"]), dtype=np.int64)
-            values = frame.loc[:, ["E", "N", "U"]].to_numpy(dtype=np.float32, copy=True)
-            valid = np.isfinite(values).astype(np.float32)
-            values = np.nan_to_num(values, copy=False)
+            component_values = frame.loc[:, list(COMPONENTS)].to_numpy(dtype=np.float32, copy=True)
+            slope_values = frame.loc[:, [f"v{comp}_slope" for comp in COMPONENTS]].to_numpy(
+                dtype=np.float32,
+                copy=True,
+            )
+            pos_mask = frame.loc[:, [f"mask_pos_{comp}" for comp in COMPONENTS]].to_numpy(
+                dtype=np.float32,
+                copy=True,
+            )
+            vel_mask = frame.loc[:, [f"mask_vel_{comp}" for comp in COMPONENTS]].to_numpy(
+                dtype=np.float32,
+                copy=True,
+            )
+
             col_slice = slice(3 * station_idx, 3 * station_idx + 3)
-            u_obs[row_idx, col_slice] = values
-            masks[row_idx, col_slice] = valid
-        return timestamps, u_obs, masks
+            u_obs[row_idx, col_slice] = component_values
+            position_masks[row_idx, col_slice] = pos_mask
+            v_obs[row_idx, col_slice] = slope_values
+            velocity_masks[row_idx, col_slice] = vel_mask
+
+        report = {
+            "n_stations": len(self.station_order),
+            "n_timestamps": n_times,
+            "position_total_components": int(sum(r["position_total_components"] for r in filter_reports)),
+            "position_valid_components": int(sum(r["position_valid_components"] for r in filter_reports)),
+            "velocity_base_components": int(sum(r["velocity_base_components"] for r in filter_reports)),
+            "velocity_valid_components": int(sum(r["velocity_valid_components"] for r in filter_reports)),
+            "robust_excluded_components": int(sum(r["robust_excluded_components"] for r in filter_reports)),
+        }
+        if report["position_total_components"] > 0:
+            report["position_valid_fraction"] = (
+                report["position_valid_components"] / report["position_total_components"]
+            )
+        else:
+            report["position_valid_fraction"] = 0.0
+        if report["velocity_base_components"] > 0:
+            report["velocity_valid_fraction"] = (
+                report["velocity_valid_components"] / report["velocity_base_components"]
+            )
+            report["robust_excluded_fraction"] = (
+                report["robust_excluded_components"] / report["velocity_base_components"]
+            )
+        else:
+            report["velocity_valid_fraction"] = 0.0
+            report["robust_excluded_fraction"] = 0.0
+
+        return timestamps, u_obs, position_masks, v_obs, velocity_masks, report
 
     def _build_data_indices(self, time_ranges_data: Sequence[tuple[Any, Any]]) -> np.ndarray:
         time_seconds = self.time_seconds.numpy()
@@ -123,8 +366,11 @@ class PINNDataloader:
                 keep |= (time_seconds >= start_sec) & (time_seconds < end_sec)
             else:
                 keep |= (time_seconds >= start_sec) & (time_seconds <= end_sec)
-        has_data = self.mask_data.sum(dim=1).numpy() > 0
-        return np.flatnonzero(keep & has_data)
+        masked_position = self.mask_data * self.training_component_mask.unsqueeze(0)
+        masked_velocity = self.mask_velocity * self.training_component_mask.unsqueeze(0)
+        has_position = masked_position.sum(dim=1).numpy() > 0
+        has_velocity = masked_velocity.sum(dim=1).numpy() > 0
+        return np.flatnonzero(keep & (has_position | has_velocity))
 
     def _to_timestamp(self, year_or_date: Any, is_end: bool = False) -> pd.Timestamp:
         if _is_year_like(year_or_date):
@@ -141,14 +387,30 @@ class PINNDataloader:
         sampled_rows = self.rng.choice(self.data_indices, size=batch_size, replace=replace)
         batch = []
         for row in np.atleast_1d(sampled_rows):
+            full_position_mask = self.mask_data[row].clone()
+            full_velocity_mask = self.mask_velocity[row].clone()
             batch.append(
                 {
                     "t_seconds": float(self.time_seconds[row].item()),
                     "u_observed": self.u_observed[row].clone(),
-                    "mask_data": self.mask_data[row].clone(),
+                    "mask_data": full_position_mask * self.training_component_mask,
+                    "v_observed": self.v_observed[row].clone(),
+                    "mask_velocity": full_velocity_mask * self.training_component_mask,
+                    "mask_data_full": full_position_mask,
+                    "mask_velocity_full": full_velocity_mask,
                 }
             )
         return batch
 
     def sample_collocation_batch(self, batch_size: int = 64) -> list[float]:
         return self.rng.uniform(self.t_phys_min, self.t_phys_max, size=batch_size).tolist()
+
+    def build_component_mask(self, markers: Sequence[str]) -> torch.Tensor:
+        mask = torch.zeros(3 * len(self.station_order), dtype=torch.float32)
+        for raw_marker in markers:
+            marker = str(raw_marker).strip().upper()
+            station_idx = self.station_index.get(marker)
+            if station_idx is None:
+                continue
+            mask[3 * station_idx : 3 * station_idx + 3] = 1.0
+        return mask
