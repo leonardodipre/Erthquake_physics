@@ -12,6 +12,8 @@ DEFAULT_OBS_COLS = ("E_clean", "N_clean", "U_clean")
 FALLBACK_OBS_COLS = ("E", "N", "U")
 COMPONENTS = ("E", "N", "U")
 SECONDS_PER_DAY = 86_400.0
+_DEG_TO_KM_LAT = 111.32
+_DEG_TO_KM_LON_AT_42 = 82.73  # 111.32 * cos(42°)
 
 
 def _as_path(path_like: str | Path) -> Path:
@@ -20,6 +22,28 @@ def _as_path(path_like: str | Path) -> Path:
 
 def _is_year_like(value: Any) -> bool:
     return isinstance(value, (int, float, np.integer, np.floating))
+
+
+def _normalize_time_ranges(
+    time_ranges_data: Sequence[tuple[Any, Any]],
+) -> tuple[tuple[Any, Any], ...]:
+    normalized: list[tuple[Any, Any]] = []
+    for idx, item in enumerate(time_ranges_data):
+        if isinstance(item, (str, bytes)):
+            raise ValueError(
+                "time_ranges_data must contain (start, end) pairs, "
+                f"but item {idx} is a string: {item!r}."
+            )
+        try:
+            start, end = item
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "time_ranges_data must be a sequence of (start, end) pairs; "
+                f"got item {idx}: {item!r}. If you meant a year interval, use "
+                "(2019, 2025), not (2019-2025)."
+            ) from exc
+        normalized.append((start, end))
+    return tuple(normalized)
 
 
 def extract_marker_from_filename(path_like: str | Path) -> str:
@@ -36,6 +60,75 @@ def list_markers_in_subdir(data_dir: str | Path, subdir: str) -> list[str]:
         return []
     markers = [extract_marker_from_filename(csv_path) for csv_path in sorted(folder.glob("*.csv"))]
     return sorted(dict.fromkeys(markers))
+
+
+def compute_station_geo_weights(
+    station_ids_path: str,
+    stations_json_path: str,
+    k: int = 5,
+    alpha: float = 0.5,
+    clip_min: float = 0.5,
+    clip_max: float = 2.0,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Compute geometric density-based weights for GNSS stations.
+
+    Returns
+    -------
+    weights_component : ndarray, shape (n_stations * 3,)
+        Per-component weights (same weight for E/N/U of each station),
+        normalized so that mean == 1.
+    diagnostics : list[dict]
+        Per-station info: marker, lat, lon, mean_knn_dist, raw_weight, weight.
+    """
+    import json
+
+    station_order = np.load(station_ids_path, allow_pickle=True).tolist()
+    station_order = [str(m).strip().upper() for m in station_order]
+
+    with open(stations_json_path) as f:
+        catalog = json.load(f)
+    coord_map: dict[str, tuple[float, float]] = {}
+    for s in catalog["stations"]:
+        marker = str(s["marker"]).strip().upper()
+        coord_map[marker] = (float(s["aprioriNorth"]), float(s["aprioriEast"]))
+
+    n = len(station_order)
+    coords_km = np.zeros((n, 2), dtype=np.float64)
+    for i, marker in enumerate(station_order):
+        lat, lon = coord_map[marker]
+        coords_km[i, 0] = lat * _DEG_TO_KM_LAT
+        coords_km[i, 1] = lon * _DEG_TO_KM_LON_AT_42
+
+    # Pairwise distances
+    from scipy.spatial import cKDTree
+    tree = cKDTree(coords_km)
+    dists, _ = tree.query(coords_km, k=k + 1)  # includes self at dist=0
+    mean_knn_dist = dists[:, 1:].mean(axis=1)  # exclude self
+
+    median_d = np.median(mean_knn_dist)
+    if median_d <= 0:
+        median_d = 1.0
+
+    raw_weights = (mean_knn_dist / median_d) ** alpha
+    clipped = np.clip(raw_weights, clip_min, clip_max)
+    clipped /= clipped.mean()  # normalize to mean=1
+
+    # Expand to per-component (E/N/U share same weight)
+    weights_component = np.repeat(clipped, 3).astype(np.float32)
+
+    diagnostics = []
+    for i, marker in enumerate(station_order):
+        lat, lon = coord_map[marker]
+        diagnostics.append({
+            "station": marker,
+            "lat": lat,
+            "lon": lon,
+            "mean_knn_dist_km": float(mean_knn_dist[i]),
+            "raw_weight": float(raw_weights[i]),
+            "weight": float(clipped[i]),
+        })
+
+    return weights_component, diagnostics
 
 
 class PINNDataloader:
@@ -59,8 +152,12 @@ class PINNDataloader:
         slope_window_days: float = 14.0,
         slope_min_points: int = 10,
         excluded_markers: Sequence[str] | None = None,
+        max_station_jump_m: float | None = None,
+        savgol_window: int = 0,
+        savgol_polyorder: int = 3,
     ) -> None:
         self.data_dir = _as_path(data_dir)
+        self.time_ranges_data = _normalize_time_ranges(time_ranges_data)
         self.station_order = np.load(_as_path(station_ids_path), allow_pickle=True).tolist()
         self.station_order = [str(marker).strip().upper() for marker in self.station_order]
         self.station_index = {marker: idx for idx, marker in enumerate(self.station_order)}
@@ -91,6 +188,13 @@ class PINNDataloader:
         if self.slope_min_points < 2:
             raise ValueError("slope_min_points must be >= 2.")
 
+        self.savgol_window = int(savgol_window)
+        if self.savgol_window > 0 and self.savgol_window % 2 == 0:
+            self.savgol_window += 1
+        self.savgol_polyorder = int(savgol_polyorder)
+        if self.savgol_window > 0 and self.savgol_polyorder >= self.savgol_window:
+            raise ValueError("savgol_polyorder must be less than savgol_window.")
+
         self.station_files = self._select_station_files()
         (
             self.timestamps,
@@ -99,12 +203,28 @@ class PINNDataloader:
             v_obs,
             velocity_masks,
             filter_report,
+            self._station_quality,
         ) = self._build_dense_observation_matrices()
         self.u_observed = torch.from_numpy(u_obs)
         self.mask_data = torch.from_numpy(position_masks)
         self.v_observed = torch.from_numpy(v_obs)
         self.mask_velocity = torch.from_numpy(velocity_masks)
         self.filter_report = filter_report
+
+        if max_station_jump_m is not None:
+            threshold = float(max_station_jump_m)
+            auto_excluded = [
+                marker for marker, q in self._station_quality.items()
+                if q["max_jump_m"] > threshold and marker not in set(self.excluded_markers)
+            ]
+            if auto_excluded:
+                self.excluded_markers = sorted(set(self.excluded_markers) | set(auto_excluded))
+                print(
+                    f"Auto-excluded {len(auto_excluded)} stations (max_jump > {threshold:.3f} m): "
+                    + ", ".join(auto_excluded),
+                    flush=True,
+                )
+
         self.training_component_mask = self.build_component_mask(
             [marker for marker in self.station_order if marker not in set(self.excluded_markers)]
         )
@@ -115,7 +235,7 @@ class PINNDataloader:
             (self.timestamps - self.reference_date).total_seconds().to_numpy(),
             dtype=torch.float32,
         )
-        self.data_indices = self._build_data_indices(time_ranges_data=time_ranges_data)
+        self.data_indices = self._build_data_indices(time_ranges_data=self.time_ranges_data)
         if len(self.data_indices) == 0:
             raise ValueError("No GNSS timestamps fall inside the requested data ranges.")
 
@@ -242,6 +362,35 @@ class PINNDataloader:
         flags[flagged_pairs + 1] = True
         return flags
 
+    def _apply_savgol_positions(
+        self,
+        t_days: np.ndarray,
+        values: np.ndarray,
+        finite_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Smooth position time series with Savitzky-Golay filter.
+
+        Interpolates over gaps, applies SG, then keeps only originally
+        finite values so masked entries stay at zero.
+        """
+        from scipy.signal import savgol_filter
+
+        result = values.copy()
+        window = self.savgol_window
+        polyorder = self.savgol_polyorder
+
+        for comp_idx in range(values.shape[1]):
+            finite = finite_mask[:, comp_idx]
+            if finite.sum() < window:
+                continue
+            t_fin = t_days[finite]
+            v_fin = values[finite, comp_idx]
+            interp_vals = np.interp(t_days, t_fin, v_fin)
+            smoothed = savgol_filter(interp_vals, window, polyorder)
+            result[finite, comp_idx] = smoothed[finite]
+
+        return result
+
     def _prepare_station_frame(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
         out = frame.copy()
         values = out.loc[:, list(COMPONENTS)].to_numpy(dtype=np.float64, copy=True)
@@ -252,6 +401,10 @@ class PINNDataloader:
             (out["date"] - out["date"].iloc[0]).dt.total_seconds().to_numpy(dtype=np.float64)
             / SECONDS_PER_DAY
         )
+
+        if self.savgol_window > 0:
+            values = self._apply_savgol_positions(t_days, values, finite_positions)
+
         slopes_m_per_s, slope_window_valid = self._windowed_slopes_m_per_s(t_days=t_days, values=values)
         velocity_base_mask = slope_window_valid[:, None] & np.isfinite(slopes_m_per_s)
 
@@ -274,26 +427,38 @@ class PINNDataloader:
             out[f"mask_vel_{component}"] = velocity_mask[:, comp_idx].astype(np.float32)
             out[f"flag_robust_{component}"] = robust_flags[:, comp_idx].astype(np.float32)
 
+        daily_jumps = np.abs(np.diff(values, axis=0))
+        max_jump_m = float(daily_jumps.max()) if daily_jumps.size > 0 else 0.0
+
         report = {
             "position_total_components": int(finite_positions.sum()),
             "position_valid_components": int(position_mask.sum()),
             "velocity_base_components": int(velocity_base_mask.sum()),
             "velocity_valid_components": int(velocity_mask.sum()),
             "robust_excluded_components": int(robust_flags.sum()),
+            "max_jump_m": max_jump_m,
+            "max_abs_position_m": float(np.abs(values).max()) if values.size > 0 else 0.0,
         }
         return out, report
 
     def _build_dense_observation_matrices(
         self,
-    ) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float | int]]:
+    ) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float | int], dict[str, dict[str, Any]]]:
         station_frames: dict[str, pd.DataFrame] = {}
         filter_reports: list[dict[str, int]] = []
+        per_station_quality: dict[str, dict[str, Any]] = {}
         date_series = []
         for marker in self.station_order:
             raw_frame = self._read_station_frame(self.station_files[marker])
             processed_frame, report = self._prepare_station_frame(raw_frame)
             station_frames[marker] = processed_frame
             filter_reports.append(report)
+            per_station_quality[marker] = {
+                "max_jump_m": report["max_jump_m"],
+                "max_abs_position_m": report["max_abs_position_m"],
+                "n_robust_excluded": report["robust_excluded_components"],
+                "n_points": len(processed_frame),
+            }
             date_series.append(processed_frame["date"])
 
         timestamps = pd.DatetimeIndex(sorted(set(pd.concat(date_series).tolist())))
@@ -354,7 +519,7 @@ class PINNDataloader:
             report["velocity_valid_fraction"] = 0.0
             report["robust_excluded_fraction"] = 0.0
 
-        return timestamps, u_obs, position_masks, v_obs, velocity_masks, report
+        return timestamps, u_obs, position_masks, v_obs, velocity_masks, report, per_station_quality
 
     def _build_data_indices(self, time_ranges_data: Sequence[tuple[Any, Any]]) -> np.ndarray:
         time_seconds = self.time_seconds.numpy()
@@ -404,6 +569,15 @@ class PINNDataloader:
 
     def sample_collocation_batch(self, batch_size: int = 64) -> list[float]:
         return self.rng.uniform(self.t_phys_min, self.t_phys_max, size=batch_size).tolist()
+
+    def station_quality_report(self) -> list[dict[str, Any]]:
+        """Return per-station quality info sorted by max_jump_m (descending)."""
+        rows = [
+            {"marker": marker, **quality}
+            for marker, quality in self._station_quality.items()
+        ]
+        rows.sort(key=lambda r: r["max_jump_m"], reverse=True)
+        return rows
 
     def build_component_mask(self, markers: Sequence[str]) -> torch.Tensor:
         mask = torch.zeros(3 * len(self.station_order), dtype=torch.float32)

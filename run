@@ -4,3 +4,46 @@ python main.py --device cuda --steps 40000 --log-every 100 --checkpoint checkpoi
 
 EVAL
 python eval.py --device cpu --checkpoint checkpoints/run_2000_2008.pt  --out-csv checkpoints/eval.csv
+
+
+python diagnose.py --checkpoint checkpoints/5_V3_moredata.pt 
+
+python main.py --device cuda --steps 4 --log-every 100 --checkpoint checkpoints/5_V3_moredata.pt
+
+
+python eval.py --device cpu --checkpoint checkpoints/4_V3_2000_2008.pt --out-csv checkpoints/5_V3_moredata.csv
+
+
+# ── Progressive time range validation ────────────────────────────────────────
+# Trains on 2000-2008, 2000-2012, 2000-2018, 2000-2025 to find collapse onset.
+# Uses: 120k steps, batch=4, 16 colloc, extended warmup, excluded bad stations.
+
+for END in 2008 2012 2018 2025; do
+  python main.py --device cuda --steps 120000 --log-every 200 \
+    --checkpoint "checkpoints/progressive_2000_${END}.pt" \
+    --config-json "{\"time_ranges_data\": [[2000, $END]], \"time_domain_physics\": [2000, $END], \"excluded_markers\": [\"UNOV00ITA\", \"GVNL00ITA\", \"TOD200ITA\"], \"data_batch_size\": 4, \"n_colloc_per_step\": 16, \"warmup_start\": 10000, \"warmup_end\": 40000, \"lambda_smooth\": 5e-4, \"lambda_friction_reg\": 0.005, \"lambda_V_temporal\": 5e-4}"
+
+  python eval.py --device cpu \
+    --checkpoint "checkpoints/progressive_2000_${END}.pt" \
+    --out-csv "checkpoints/progressive_2000_${END}_eval.csv"
+
+  python diagnose.py \
+    --checkpoint "checkpoints/progressive_2000_${END}.pt" \
+    --outdir "diagnostics/progressive_2000_${END}" \
+    --time-start 2000 --time-end $END
+
+  python diagnose.py \
+    --history "checkpoints/progressive_2000_${END}.history.csv" \
+    --outdir "diagnostics/progressive_2000_${END}"
+done
+
+
+# ── Multi-seed comparison (run on the range where collapse starts) ────────────
+# Adjust END_YEAR to the collapse onset found in progressive validation.
+
+END_YEAR=2025
+for SEED in 42 123 456; do
+  python main.py --device cuda --steps 120000 --log-every 200 --seed $SEED \
+    --checkpoint "checkpoints/seed_${SEED}_2000_${END_YEAR}.pt" \
+    --config-json "{\"time_ranges_data\": [[2000, $END_YEAR]], \"time_domain_physics\": [2000, $END_YEAR], \"excluded_markers\": [\"UNOV00ITA\", \"GVNL00ITA\", \"TOD200ITA\"], \"data_batch_size\": 4, \"n_colloc_per_step\": 16, \"warmup_start\": 10000, \"warmup_end\": 40000, \"lambda_smooth\": 5e-4, \"lambda_friction_reg\": 0.005, \"lambda_V_temporal\": 5e-4}"
+done

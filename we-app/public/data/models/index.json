@@ -1,0 +1,217 @@
+{
+  "default_model_key": "8_v5",
+  "models": [
+    {
+      "key": "1_v1",
+      "label": "1_V1",
+      "checkpoint": "checkpoints/1_V1/1_run_2000_2008.pt",
+      "evaluation_csv": "checkpoints/1_V1/1_eval_run_2000_2008.csv",
+      "history_csv": null,
+      "snapshot_index_path": "/data/model_snapshots/1_v1/index.json",
+      "station_sensitivity_path": null,
+      "snapshot_count": 109,
+      "time_range": {
+        "start": "2000-01-01T11:59:00",
+        "end": "2008-12-31T11:59:00"
+      },
+      "metrics_summary": {
+        "sample_count": 3288,
+        "date_range": {
+          "start": "2000-01-01T11:59:00",
+          "end": "2008-12-31T11:59:00"
+        },
+        "median_rmse_mm": 8.813201915472746,
+        "p90_rmse_mm": 14.90866532549262,
+        "worst_rmse_mm": 18.475791439414024
+      },
+      "history_summary": null,
+      "station_sensitivity_summary": null
+    },
+    {
+      "key": "2_v2",
+      "label": "2_V2",
+      "checkpoint": "checkpoints/2_V2/V2_run_2000_2008.pt",
+      "evaluation_csv": "checkpoints/2_V2/V2_run_2000_2008.csv",
+      "history_csv": null,
+      "snapshot_index_path": "/data/model_snapshots/2_v2/index.json",
+      "station_sensitivity_path": null,
+      "snapshot_count": 109,
+      "time_range": {
+        "start": "2000-01-01T11:59:00",
+        "end": "2008-12-31T11:59:00"
+      },
+      "metrics_summary": {
+        "sample_count": 3288,
+        "date_range": {
+          "start": "2000-01-01T11:59:00",
+          "end": "2008-12-31T11:59:00"
+        },
+        "median_rmse_mm": 8.641479071229696,
+        "p90_rmse_mm": 14.820665307343004,
+        "worst_rmse_mm": 18.357573077082638
+      },
+      "history_summary": null,
+      "station_sensitivity_summary": null
+    },
+    {
+      "key": "3_v2",
+      "label": "3_V2",
+      "checkpoint": "checkpoints/3_V2/3_V2_run_holdouts_2000_2008.pt",
+      "evaluation_csv": "checkpoints/3_V2/3_eval_run_holdouts.csv",
+      "history_csv": null,
+      "snapshot_index_path": "/data/model_snapshots/3_v2/index.json",
+      "station_sensitivity_path": null,
+      "snapshot_count": 109,
+      "time_range": {
+        "start": "2000-01-01T11:59:00",
+        "end": "2008-12-31T11:59:00"
+      },
+      "metrics_summary": {
+        "sample_count": 3288,
+        "date_range": {
+          "start": "2000-01-01T11:59:00",
+          "end": "2008-12-31T11:59:00"
+        },
+        "median_rmse_mm": 8.6664161644876,
+        "p90_rmse_mm": 14.818538911640644,
+        "worst_rmse_mm": 18.385786563158035
+      },
+      "history_summary": null,
+      "station_sensitivity_summary": null
+    },
+    {
+      "key": "4_v3_claudio_model",
+      "label": "4_V3(claudio_model)",
+      "checkpoint": "checkpoints/4_V3(claudio_model)/4_V3_2000_2008.pt",
+      "evaluation_csv": "checkpoints/4_V3(claudio_model)/4_aval_V3.csv",
+      "history_csv": null,
+      "snapshot_index_path": "/data/model_snapshots/4_v3_claudio_model/index.json",
+      "station_sensitivity_path": "/data/model_station_sensitivity/4_v3_claudio_model.json",
+      "snapshot_count": 109,
+      "time_range": {
+        "start": "2000-01-01T11:59:00",
+        "end": "2008-12-31T11:59:00"
+      },
+      "metrics_summary": {
+        "sample_count": 3288,
+        "date_range": {
+          "start": "2000-01-01T11:59:00",
+          "end": "2008-12-31T11:59:00"
+        },
+        "median_rmse_mm": 8.714458905160427,
+        "p90_rmse_mm": 14.830849878489971,
+        "worst_rmse_mm": 18.42935755848885
+      },
+      "history_summary": null,
+      "station_sensitivity_summary": {
+        "station_count": 228,
+        "max_sensitivity": 0.027927586808800697,
+        "median_sensitivity": 0.00022346954210661352,
+        "top_station": "SGRE00ITA"
+      }
+    },
+    {
+      "key": "5_v3",
+      "label": "5_V3",
+      "checkpoint": "checkpoints/5_V3/5_V3_moredata.pt",
+      "evaluation_csv": "checkpoints/5_V3/5_V3_moredata_resume.csv",
+      "history_csv": null,
+      "snapshot_index_path": "/data/model_snapshots/5_v3/index.json",
+      "station_sensitivity_path": "/data/model_station_sensitivity/5_v3.json",
+      "snapshot_count": 304,
+      "time_range": {
+        "start": "2000-01-01T11:59:00",
+        "end": "2025-03-25T11:59:00"
+      },
+      "metrics_summary": {
+        "sample_count": 5562,
+        "date_range": {
+          "start": "2000-01-01T11:59:00",
+          "end": "2025-03-25T11:59:00"
+        },
+        "median_rmse_mm": 14.531079214066267,
+        "p90_rmse_mm": 32.64694027602673,
+        "worst_rmse_mm": 287.00196743011475
+      },
+      "history_summary": null,
+      "station_sensitivity_summary": {
+        "station_count": 228,
+        "max_sensitivity": 0.027927586808800697,
+        "median_sensitivity": 0.00022346954210661352,
+        "top_station": "SGRE00ITA"
+      }
+    },
+    {
+      "key": "8_v5",
+      "label": "8_V5",
+      "checkpoint": "checkpoints/8_V5/8_V5_alldata_bigmodel.pt",
+      "evaluation_csv": "checkpoints/8_V5/8_V5.csv",
+      "history_csv": "checkpoints/8_V5/8_V5_alldata_bigmodel.history.csv",
+      "snapshot_index_path": "/data/model_snapshots/8_v5/index.json",
+      "station_sensitivity_path": "/data/model_station_sensitivity/8_v5.json",
+      "snapshot_count": 64,
+      "time_range": {
+        "start": "2020-01-01T11:59:00",
+        "end": "2025-03-25T11:59:00"
+      },
+      "metrics_summary": {
+        "sample_count": 1909,
+        "date_range": {
+          "start": "2020-01-01T11:59:00",
+          "end": "2025-03-25T11:59:00"
+        },
+        "median_rmse_mm": 28.40185910463333,
+        "p90_rmse_mm": 36.36246919631958,
+        "worst_rmse_mm": 286.8095338344574
+      },
+      "history_summary": {
+        "step_count": 201,
+        "final_total_loss": 0.018441891297698,
+        "best_total_loss": 0.0174339935183525,
+        "final_slip_max_m": 1.164787769317627
+      },
+      "station_sensitivity_summary": {
+        "station_count": 228,
+        "max_sensitivity": 0.027927586808800697,
+        "median_sensitivity": 0.00022346954210661352,
+        "top_station": "SGRE00ITA"
+      }
+    },
+    {
+      "key": "9_v5",
+      "label": "9_V5",
+      "checkpoint": "checkpoints/9_V5/9_beforaquila_2009.pt",
+      "evaluation_csv": "checkpoints/9_V5/9_beforaquila_2009.csv",
+      "history_csv": "checkpoints/9_V5/9_beforaquila_2009.history.csv",
+      "snapshot_index_path": "/data/model_snapshots/9_v5/index.json",
+      "station_sensitivity_path": "/data/model_station_sensitivity/9_v5.json",
+      "snapshot_count": 109,
+      "time_range": {
+        "start": "2000-01-01T11:59:00",
+        "end": "2008-12-31T11:59:00"
+      },
+      "metrics_summary": {
+        "sample_count": 3288,
+        "date_range": {
+          "start": "2000-01-01T11:59:00",
+          "end": "2008-12-31T11:59:00"
+        },
+        "median_rmse_mm": 8.775645401328802,
+        "p90_rmse_mm": 14.902838133275509,
+        "worst_rmse_mm": 18.455496057868004
+      },
+      "history_summary": {
+        "step_count": 201,
+        "final_total_loss": 0.0043780887499451,
+        "best_total_loss": 0.0040496513247489,
+        "final_slip_max_m": 0.1711019575595855
+      },
+      "station_sensitivity_summary": {
+        "station_count": 228,
+        "max_sensitivity": 0.027927586808800697,
+        "median_sensitivity": 0.00022346954210661352,
+        "top_station": "SGRE00ITA"
+      }
+    }
+  ]
+}

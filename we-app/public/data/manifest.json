@@ -1,0 +1,45 @@
+{
+  "app_title": "L'Aquila Fault Explorer",
+  "generated_at": "2026-03-13T15:49:29.495820+00:00",
+  "paths": {
+    "fault_geojson": "/data/fault.geojson",
+    "fault_patches": "/data/fault_patches.json",
+    "station_metadata": "/data/station_metadata.json",
+    "stations": "/data/stations.json",
+    "timeseries_dir": "/data/timeseries",
+    "models_index": "/data/models/index.json",
+    "snapshots_index": "/data/model_snapshots/index.json",
+    "metrics": {
+      "evaluation": "/data/metrics/evaluation.json",
+      "training_history": "/data/metrics/training_history.json",
+      "station_sensitivity": "/data/metrics/station_sensitivity.json"
+    }
+  },
+  "summary": {
+    "fault_patches": 1914,
+    "stations": 228,
+    "snapshots": 64,
+    "models": 7,
+    "coordinate_source": "dataset_scremato/stations_ITA_laquila_150km.json"
+  },
+  "metrics_summary": {
+    "evaluation": {
+      "sample_count": 1909,
+      "date_range": {
+        "start": "2020-01-01T11:59:00",
+        "end": "2025-03-25T11:59:00"
+      },
+      "median_rmse_mm": 28.40185910463333,
+      "p90_rmse_mm": 36.36246919631958,
+      "worst_rmse_mm": 286.8095338344574,
+      "median_velocity_rmse_mm_per_day": 0.2436084997725629
+    },
+    "training_history": {
+      "step_count": 201,
+      "final_total_loss": 0.018441891297698,
+      "best_total_loss": 0.0174339935183525,
+      "final_slip_max_m": 1.164787769317627,
+      "final_a_minus_b_mean": 0.0001348391815554
+    }
+  }
+}

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from config import DEFAULT_CONFIG
-from dataset import PINNDataloader, list_markers_in_subdir
+from dataset import PINNDataloader, compute_station_geo_weights, list_markers_in_subdir
 from fault import load_fault_coordinates
 from loss import PINNLoss
 from model import HybridPINN, load_green_matrices
@@ -164,9 +164,41 @@ def train_pinn(
         slope_window_days=float(cfg.get("slope_window_days", 14.0)),
         slope_min_points=int(cfg.get("slope_min_points", 10)),
         excluded_markers=excluded_markers,
+        max_station_jump_m=cfg.get("max_station_jump_m"),
+        savgol_window=int(cfg.get("savgol_window", 0)),
+        savgol_polyorder=int(cfg.get("savgol_polyorder", 3)),
     )
 
+    checkpoint = _as_path(checkpoint_path)
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+
     pinn = _build_model(cfg=cfg, K_cd=K_cd, K_ij=K_ij, n_patches=n_patches, device=device)
+
+    # Geometric station weighting
+    station_weights_tensor: torch.Tensor | None = None
+    if cfg.get("geo_weight_enabled", False):
+        import json as _json_mod
+        stations_json = str(cfg.get("stations_json", "dataset_scremato/stations_ITA_laquila_150km.json"))
+        station_ids_path = str(_as_path(green_dir) / "station_ids.npy")
+        geo_weights, geo_diag = compute_station_geo_weights(
+            station_ids_path=station_ids_path,
+            stations_json_path=stations_json,
+            k=int(cfg.get("geo_weight_k", 5)),
+            alpha=float(cfg.get("geo_weight_alpha", 0.5)),
+            clip_min=float(cfg.get("geo_weight_clip_min", 0.5)),
+            clip_max=float(cfg.get("geo_weight_clip_max", 2.0)),
+        )
+        station_weights_tensor = torch.from_numpy(geo_weights).to(device)
+        # Save diagnostics
+        diag_path = checkpoint.parent / "station_geo_weights.json"
+        with open(diag_path, "w") as f:
+            _json_mod.dump(geo_diag, f, indent=2)
+        w_vals = [d["weight"] for d in geo_diag]
+        print(
+            f"Geo weights | min={min(w_vals):.3f} max={max(w_vals):.3f} "
+            f"mean={np.mean(w_vals):.3f} | saved to {diag_path}",
+            flush=True,
+        )
 
     losses = PINNLoss(
         neighbors=neighbors,
@@ -176,6 +208,7 @@ def train_pinn(
         velocity_huber_beta=float(cfg.get("velocity_huber_beta", 1.0)),
         position_component_weights=tuple(cfg.get("position_component_weights", (1.0, 1.0, 1.0))),
         velocity_component_weights=tuple(cfg.get("velocity_component_weights", (1.0, 1.0, 1.0))),
+        station_weights=station_weights_tensor,
     )
     optimizer = torch.optim.AdamW(
         pinn.parameters(),
@@ -189,8 +222,6 @@ def train_pinn(
     )
 
     history: list[dict[str, float]] = []
-    checkpoint = _as_path(checkpoint_path)
-    checkpoint.parent.mkdir(parents=True, exist_ok=True)
     total_steps = int(cfg["total_steps"])
     log_every = max(1, int(cfg["log_every"]))
 
@@ -204,13 +235,22 @@ def train_pinn(
             f"Holdout stations excluded from train: {', '.join(excluded_markers)}",
             flush=True,
         )
+    savgol_w = int(cfg.get("savgol_window", 0))
     print(
         "Dataset filter | "
         f"pos_valid={dataloader.filter_report['position_valid_fraction']:.3f} | "
         f"vel_valid={dataloader.filter_report['velocity_valid_fraction']:.3f} | "
-        f"robust_excluded={dataloader.filter_report['robust_excluded_fraction']:.3f}",
+        f"robust_excluded={dataloader.filter_report['robust_excluded_fraction']:.3f} | "
+        f"savgol={'off' if savgol_w == 0 else f'{savgol_w}d'}",
         flush=True,
     )
+    quality = dataloader.station_quality_report()
+    top_jumpers = [q for q in quality[:10] if q["max_jump_m"] > 0.01]
+    if top_jumpers:
+        print("Top stations by max daily jump (m):", flush=True)
+        for q in top_jumpers:
+            tag = " [EXCLUDED]" if q["marker"] in set(dataloader.excluded_markers) else ""
+            print(f"  {q['marker']:16s}  jump={q['max_jump_m']:.4f}  max_pos={q['max_abs_position_m']:.4f}{tag}", flush=True)
 
     for step in range(total_steps):
         optimizer.zero_grad(set_to_none=True)
@@ -270,9 +310,13 @@ def train_pinn(
             )
 
         collocation_times = dataloader.sample_collocation_batch(batch_size=int(cfg["n_colloc_per_step"]))
+        collocation_times.sort()
         L_rsf = torch.zeros((), dtype=torch.float32, device=device)
         L_state = torch.zeros((), dtype=torch.float32, device=device)
         L_smooth = torch.zeros((), dtype=torch.float32, device=device)
+        L_friction_reg = torch.zeros((), dtype=torch.float32, device=device)
+        L_V_temporal = torch.zeros((), dtype=torch.float32, device=device)
+        prev_V: torch.Tensor | None = None
         for t_colloc in collocation_times:
             out_phys = pinn(xi, eta, t_colloc)
             L_rsf = L_rsf + losses.rsf(
@@ -286,21 +330,39 @@ def train_pinn(
                 d_c=out_phys["D_c"],
             )
             L_smooth = L_smooth + losses.smooth(out_phys["s"])
+            L_friction_reg = L_friction_reg + losses.friction_reg(
+                a=out_phys["a"],
+                b=out_phys["b"],
+                target_ab_mean=float(cfg.get("target_ab_mean", 0.0)),
+                target_ab_std=float(cfg.get("target_ab_std", 0.008)),
+            )
+            if prev_V is not None:
+                L_V_temporal = L_V_temporal + losses.V_temporal(
+                    V_current=out_phys["V"],
+                    V_other=prev_V,
+                )
+            prev_V = out_phys["V"]
         n_colloc = max(len(collocation_times), 1)
         L_rsf = L_rsf / n_colloc
         L_state = L_state / n_colloc
         L_smooth = L_smooth / n_colloc
+        L_friction_reg = L_friction_reg / n_colloc
+        L_V_temporal = L_V_temporal / max(n_colloc - 1, 1)
 
         w_rsf, w_state = PINNLoss.anneal_weights(
             step=step,
             lambda_rsf=float(cfg["lambda_rsf"]),
             lambda_state=float(cfg["lambda_state"]),
+            warmup_start=int(cfg.get("warmup_start", 5_000)),
+            warmup_end=int(cfg.get("warmup_end", 15_000)),
         )
         L_total = (
             float(cfg["lambda_data"]) * L_data
             + w_rsf * L_rsf
             + w_state * L_state
             + float(cfg["lambda_smooth"]) * L_smooth
+            + float(cfg.get("lambda_friction_reg", 0.0)) * L_friction_reg
+            + float(cfg.get("lambda_V_temporal", 0.0)) * L_V_temporal
         )
 
         L_total.backward()
@@ -322,10 +384,20 @@ def train_pinn(
                     "L_rsf": float(L_rsf.detach().cpu()),
                     "L_state": float(L_state.detach().cpu()),
                     "L_smooth": float(L_smooth.detach().cpu()),
+                    "L_friction_reg": float(L_friction_reg.detach().cpu()),
+                    "L_V_temporal": float(L_V_temporal.detach().cpu()),
                     "a_minus_b_min": float(ab.min().detach().cpu()),
                     "a_minus_b_max": float(ab.max().detach().cpu()),
+                    "a_minus_b_mean": float(ab.mean().detach().cpu()),
+                    "a_minus_b_std": float(ab.std().detach().cpu()),
                     "tau_0_mean": float(pinn.tau_0.mean().detach().cpu()),
                     "tau_dot_mean": float(pinn.tau_dot.mean().detach().cpu()),
+                    "lr": float(optimizer.param_groups[0]["lr"]),
+                    "w_rsf": float(w_rsf),
+                    "w_state": float(w_state),
+                    "V_log10_mean": float(torch.log10(out_data["V"].abs() + 1e-20).mean().detach().cpu()),
+                    "V_log10_std": float(torch.log10(out_data["V"].abs() + 1e-20).std().detach().cpu()),
+                    "slip_max": float(out_data["s"].abs().max().detach().cpu()),
                 }
                 history.append(log_entry)
                 print(
@@ -333,13 +405,12 @@ def train_pinn(
                     f"L_tot={log_entry['L_total']:.2e} | "
                     f"L_pos={log_entry['L_position']:.2e} | "
                     f"L_vel={log_entry['L_velocity']:.2e} | "
-                    f"L_data={log_entry['L_data']:.2e} | "
                     f"L_rsf={log_entry['L_rsf']:.2e} | "
                     f"L_state={log_entry['L_state']:.2e} | "
-                    f"L_smooth={log_entry['L_smooth']:.2e} | "
-                    f"(a-b)=[{log_entry['a_minus_b_min']:.4f},{log_entry['a_minus_b_max']:.4f}] | "
-                    f"tau_0_mean={log_entry['tau_0_mean']:.2e} | "
-                    f"tau_dot_mean={log_entry['tau_dot_mean']:.2e}"
+                    f"L_freg={log_entry['L_friction_reg']:.2e} | "
+                    f"L_Vt={log_entry['L_V_temporal']:.2e} | "
+                    f"(a-b)=[{log_entry['a_minus_b_min']:.4f},{log_entry['a_minus_b_max']:.4f}] "
+                    f"mean={log_entry['a_minus_b_mean']:.4f} std={log_entry['a_minus_b_std']:.4f}"
                     ,
                     flush=True,
                 )
@@ -353,6 +424,12 @@ def train_pinn(
         summary=summary,
     )
     print(f"Training done | checkpoint saved to {checkpoint}", flush=True)
+
+    if history:
+        import pandas as pd
+        history_path = checkpoint.with_suffix(".history.csv")
+        pd.DataFrame(history).to_csv(history_path, index=False)
+        print(f"Training history saved to {history_path}", flush=True)
     return {
         "model": pinn,
         "history": history,
@@ -369,18 +446,35 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", default="checkpoints/model.pt")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--config-json",
+        default=None,
+        help="JSON string or path to JSON file with config overrides",
+    )
     return parser
 
 
 def main() -> None:
+    import json as _json
+    import os as _os
+
     parser = _build_parser()
     args = parser.parse_args()
 
     cfg: dict[str, Any] = {}
+    if args.config_json is not None:
+        if _os.path.isfile(args.config_json):
+            with open(args.config_json) as f:
+                cfg.update(_json.load(f))
+        else:
+            cfg.update(_json.loads(args.config_json))
     if args.steps is not None:
         cfg["total_steps"] = args.steps
     if args.log_every is not None:
         cfg["log_every"] = max(1, int(args.log_every))
+    if args.seed is not None:
+        cfg["seed"] = args.seed
 
     train_pinn(
         config=cfg,
