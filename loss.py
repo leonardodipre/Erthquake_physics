@@ -163,6 +163,19 @@ def compute_L_ab_prior(
     )
 
 
+def compute_L_dc_prior(
+    D_c: Tensor,
+    dc_prior_mean: float = 0.02,
+    dc_prior_std: float = 0.01,
+) -> Tensor:
+    """Weak Gaussian prior on mean(D_c).
+
+    Prevents D_c from acting as free compensator for a, b, theta.
+    """
+    std = max(dc_prior_std, 1e-6)
+    return ((D_c.mean() - dc_prior_mean) / std).square()
+
+
 def compute_L_V_temporal(V_current: Tensor, V_other: Tensor) -> Tensor:
     """Penalize large temporal jumps in slip rate between two collocation times.
 
@@ -356,6 +369,35 @@ class PINNLoss:
         s_flat = slip.squeeze(-1)
         diffs = s_flat[edge_index[:, 0]] - s_flat[edge_index[:, 1]]
         return torch.mean(diffs.square())
+
+    @staticmethod
+    def ab_prior(
+        a: Tensor,
+        b: Tensor,
+        a_prior_mean: float = 0.015,
+        b_prior_mean: float = 0.020,
+        a_prior_std: float = 0.010,
+        b_prior_std: float = 0.010,
+    ) -> Tensor:
+        return compute_L_ab_prior(
+            a=a, b=b,
+            a_prior_mean=a_prior_mean,
+            b_prior_mean=b_prior_mean,
+            a_prior_std=a_prior_std,
+            b_prior_std=b_prior_std,
+        )
+
+    @staticmethod
+    def dc_prior(
+        D_c: Tensor,
+        dc_prior_mean: float = 0.02,
+        dc_prior_std: float = 0.01,
+    ) -> Tensor:
+        return compute_L_dc_prior(
+            D_c=D_c,
+            dc_prior_mean=dc_prior_mean,
+            dc_prior_std=dc_prior_std,
+        )
 
     def boundary_V(self, V: Tensor, V_ref: float = 1e-9) -> Tensor:
         if self._boundary_weights is None:

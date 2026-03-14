@@ -323,6 +323,7 @@ def train_pinn(
         L_friction_reg = torch.zeros((), dtype=torch.float32, device=device)
         L_V_temporal = torch.zeros((), dtype=torch.float32, device=device)
         L_boundary_V = torch.zeros((), dtype=torch.float32, device=device)
+        L_ab_prior = torch.zeros((), dtype=torch.float32, device=device)
         prev_V: torch.Tensor | None = None
         boundary_V_ref = float(cfg.get("boundary_V_ref", 1e-9))
         for t_colloc in collocation_times:
@@ -347,6 +348,14 @@ def train_pinn(
             L_boundary_V = L_boundary_V + losses.boundary_V(
                 V=out_phys["V"], V_ref=boundary_V_ref,
             )
+            L_ab_prior = L_ab_prior + losses.ab_prior(
+                a=out_phys["a"],
+                b=out_phys["b"],
+                a_prior_mean=float(cfg.get("a_prior_mean", 0.015)),
+                b_prior_mean=float(cfg.get("b_prior_mean", 0.020)),
+                a_prior_std=float(cfg.get("a_prior_std", 0.010)),
+                b_prior_std=float(cfg.get("b_prior_std", 0.010)),
+            )
             if prev_V is not None:
                 L_V_temporal = L_V_temporal + losses.V_temporal(
                     V_current=out_phys["V"],
@@ -359,6 +368,7 @@ def train_pinn(
         L_smooth = L_smooth / n_colloc
         L_friction_reg = L_friction_reg / n_colloc
         L_boundary_V = L_boundary_V / n_colloc
+        L_ab_prior = L_ab_prior / n_colloc
         L_V_temporal = L_V_temporal / max(n_colloc - 1, 1)
 
         w_rsf, w_state = PINNLoss.anneal_weights(
@@ -376,6 +386,7 @@ def train_pinn(
             + float(cfg.get("lambda_friction_reg", 0.0)) * L_friction_reg
             + float(cfg.get("lambda_V_temporal", 0.0)) * L_V_temporal
             + float(cfg.get("lambda_boundary_V", 0.0)) * L_boundary_V
+            + float(cfg.get("lambda_ab_prior", 0.0)) * L_ab_prior
         )
 
         L_total.backward()
@@ -400,6 +411,11 @@ def train_pinn(
                     "L_friction_reg": float(L_friction_reg.detach().cpu()),
                     "L_V_temporal": float(L_V_temporal.detach().cpu()),
                     "L_boundary_V": float(L_boundary_V.detach().cpu()),
+                    "L_ab_prior": float(L_ab_prior.detach().cpu()),
+                    "a_mean": float(out_data["a"].mean().detach().cpu()),
+                    "a_std": float(out_data["a"].std().detach().cpu()),
+                    "b_mean": float(out_data["b"].mean().detach().cpu()),
+                    "b_std": float(out_data["b"].std().detach().cpu()),
                     "a_minus_b_min": float(ab.min().detach().cpu()),
                     "a_minus_b_max": float(ab.max().detach().cpu()),
                     "a_minus_b_mean": float(ab.mean().detach().cpu()),
@@ -424,6 +440,9 @@ def train_pinn(
                     f"L_freg={log_entry['L_friction_reg']:.2e} | "
                     f"L_Vt={log_entry['L_V_temporal']:.2e} | "
                     f"L_bV={log_entry['L_boundary_V']:.2e} | "
+                    f"L_abp={log_entry['L_ab_prior']:.2e} | "
+                    f"a={log_entry['a_mean']:.4f}±{log_entry['a_std']:.4f} "
+                    f"b={log_entry['b_mean']:.4f}±{log_entry['b_std']:.4f} | "
                     f"(a-b)=[{log_entry['a_minus_b_min']:.4f},{log_entry['a_minus_b_max']:.4f}] "
                     f"mean={log_entry['a_minus_b_mean']:.4f} std={log_entry['a_minus_b_std']:.4f}"
                     ,
