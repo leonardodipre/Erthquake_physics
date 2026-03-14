@@ -141,6 +141,28 @@ def compute_L_friction_reg(
     return mean_penalty + std_penalty + 0.1 * smooth_penalty
 
 
+def compute_L_ab_prior(
+    a: Tensor,
+    b: Tensor,
+    a_prior_mean: float = 0.015,
+    b_prior_mean: float = 0.020,
+    a_prior_std: float = 0.010,
+    b_prior_std: float = 0.010,
+) -> Tensor:
+    """Weak Gaussian prior on mean(a) and mean(b) individually.
+
+    Separate from friction_reg (which constrains a-b). This helps
+    anchor the absolute values of a and b to physically plausible
+    ranges, reducing trade-offs with theta and D_c.
+    """
+    a_std = max(a_prior_std, 1e-6)
+    b_std = max(b_prior_std, 1e-6)
+    return (
+        ((a.mean() - a_prior_mean) / a_std).square()
+        + ((b.mean() - b_prior_mean) / b_std).square()
+    )
+
+
 def compute_L_V_temporal(V_current: Tensor, V_other: Tensor) -> Tensor:
     """Penalize large temporal jumps in slip rate between two collocation times.
 
@@ -150,6 +172,62 @@ def compute_L_V_temporal(V_current: Tensor, V_other: Tensor) -> Tensor:
     log_V_curr = torch.log(V_current.abs() + eps)
     log_V_other = torch.log(V_other.abs() + eps)
     return torch.mean((log_V_curr - log_V_other).square())
+
+
+def build_boundary_weight_map(
+    nx: int,
+    ny: int,
+    decay_xi: int = 5,
+    decay_eta: int = 3,
+    shallow_factor: float = 2.0,
+    left_factor: float = 2.0,
+) -> Tensor:
+    """Build a per-patch weight map that is high at edges and decays inward.
+
+    The weight for patch (ix, iy) is the max of contributions from each edge,
+    where each contribution decays exponentially from that edge.
+    Shallow (iy=0) and left (ix=0) edges get extra amplification.
+
+    Returns shape (nx*ny,) weight map, normalized so max=1.
+    """
+    w = torch.zeros(ny, nx)
+    for iy in range(ny):
+        for ix in range(nx):
+            # Distance from each edge in patch units
+            d_left = ix
+            d_right = nx - 1 - ix
+            d_shallow = iy          # iy=0 is shallow
+            d_deep = ny - 1 - iy
+
+            # Exponential decay from each edge
+            w_left = left_factor * torch.exp(torch.tensor(-d_left / max(decay_xi, 1.0)))
+            w_right = torch.exp(torch.tensor(-d_right / max(decay_xi, 1.0)))
+            w_shallow = shallow_factor * torch.exp(torch.tensor(-d_shallow / max(decay_eta, 1.0)))
+            w_deep = torch.exp(torch.tensor(-d_deep / max(decay_eta, 1.0)))
+
+            w[iy, ix] = max(w_left, w_right, w_shallow, w_deep)
+
+    w_flat = w.reshape(-1)
+    w_flat = w_flat / w_flat.max()  # normalize so max=1
+    return w_flat
+
+
+def compute_L_boundary_V(
+    V: Tensor,
+    boundary_weights: Tensor,
+    V_ref: float = 1e-9,
+) -> Tensor:
+    """Penalize slip rate at boundary patches exceeding V_ref.
+
+    L = mean(w_boundary * relu(log10(|V|) - log10(V_ref))^2)
+
+    Only penalizes V above the reference plate rate, so normal
+    tectonic creep is not penalized.
+    """
+    log_V = torch.log10(V.abs().squeeze(-1) + 1e-30)
+    log_ref = torch.log10(torch.tensor(V_ref, dtype=V.dtype, device=V.device))
+    excess = torch.nn.functional.relu(log_V - log_ref)
+    return torch.mean(boundary_weights * excess.square())
 
 
 def compute_L_smooth(slip: Tensor, neighbors: list[list[int]]) -> Tensor:
@@ -175,6 +253,12 @@ class PINNLoss:
         position_component_weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
         velocity_component_weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
         station_weights: Tensor | None = None,
+        nx: int | None = None,
+        ny: int | None = None,
+        boundary_decay_xi: int = 5,
+        boundary_decay_eta: int = 3,
+        boundary_shallow_factor: float = 2.0,
+        boundary_left_factor: float = 2.0,
     ) -> None:
         self.neighbors = neighbors
         self.sigma_n = sigma_n
@@ -184,6 +268,19 @@ class PINNLoss:
         self.position_component_weights = tuple(float(v) for v in position_component_weights)
         self.velocity_component_weights = tuple(float(v) for v in velocity_component_weights)
         self.station_weights = station_weights  # shape (n_stations * 3,) or None
+
+        # Boundary weight map for V penalty
+        self._boundary_weights: Tensor | None = None
+        self._boundary_weights_cache: dict[str, Tensor] = {}
+        if nx is not None and ny is not None:
+            self._boundary_weights = build_boundary_weight_map(
+                nx=nx, ny=ny,
+                decay_xi=boundary_decay_xi,
+                decay_eta=boundary_decay_eta,
+                shallow_factor=boundary_shallow_factor,
+                left_factor=boundary_left_factor,
+            )
+
         edges = []
         for i, nbrs in enumerate(neighbors):
             for j in nbrs:
@@ -259,6 +356,16 @@ class PINNLoss:
         s_flat = slip.squeeze(-1)
         diffs = s_flat[edge_index[:, 0]] - s_flat[edge_index[:, 1]]
         return torch.mean(diffs.square())
+
+    def boundary_V(self, V: Tensor, V_ref: float = 1e-9) -> Tensor:
+        if self._boundary_weights is None:
+            return torch.zeros((), dtype=V.dtype, device=V.device)
+        cache_key = str(V.device)
+        bw = self._boundary_weights_cache.get(cache_key)
+        if bw is None:
+            bw = self._boundary_weights.to(device=V.device, non_blocking=True)
+            self._boundary_weights_cache[cache_key] = bw
+        return compute_L_boundary_V(V=V, boundary_weights=bw, V_ref=V_ref)
 
     @staticmethod
     def anneal_weights(

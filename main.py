@@ -209,6 +209,12 @@ def train_pinn(
         position_component_weights=tuple(cfg.get("position_component_weights", (1.0, 1.0, 1.0))),
         velocity_component_weights=tuple(cfg.get("velocity_component_weights", (1.0, 1.0, 1.0))),
         station_weights=station_weights_tensor,
+        nx=summary.get("nx"),
+        ny=summary.get("ny"),
+        boundary_decay_xi=int(cfg.get("boundary_decay_xi", 5)),
+        boundary_decay_eta=int(cfg.get("boundary_decay_eta", 3)),
+        boundary_shallow_factor=float(cfg.get("boundary_shallow_factor", 2.0)),
+        boundary_left_factor=float(cfg.get("boundary_left_factor", 2.0)),
     )
     optimizer = torch.optim.AdamW(
         pinn.parameters(),
@@ -316,7 +322,9 @@ def train_pinn(
         L_smooth = torch.zeros((), dtype=torch.float32, device=device)
         L_friction_reg = torch.zeros((), dtype=torch.float32, device=device)
         L_V_temporal = torch.zeros((), dtype=torch.float32, device=device)
+        L_boundary_V = torch.zeros((), dtype=torch.float32, device=device)
         prev_V: torch.Tensor | None = None
+        boundary_V_ref = float(cfg.get("boundary_V_ref", 1e-9))
         for t_colloc in collocation_times:
             out_phys = pinn(xi, eta, t_colloc)
             L_rsf = L_rsf + losses.rsf(
@@ -336,6 +344,9 @@ def train_pinn(
                 target_ab_mean=float(cfg.get("target_ab_mean", 0.0)),
                 target_ab_std=float(cfg.get("target_ab_std", 0.008)),
             )
+            L_boundary_V = L_boundary_V + losses.boundary_V(
+                V=out_phys["V"], V_ref=boundary_V_ref,
+            )
             if prev_V is not None:
                 L_V_temporal = L_V_temporal + losses.V_temporal(
                     V_current=out_phys["V"],
@@ -347,6 +358,7 @@ def train_pinn(
         L_state = L_state / n_colloc
         L_smooth = L_smooth / n_colloc
         L_friction_reg = L_friction_reg / n_colloc
+        L_boundary_V = L_boundary_V / n_colloc
         L_V_temporal = L_V_temporal / max(n_colloc - 1, 1)
 
         w_rsf, w_state = PINNLoss.anneal_weights(
@@ -363,6 +375,7 @@ def train_pinn(
             + float(cfg["lambda_smooth"]) * L_smooth
             + float(cfg.get("lambda_friction_reg", 0.0)) * L_friction_reg
             + float(cfg.get("lambda_V_temporal", 0.0)) * L_V_temporal
+            + float(cfg.get("lambda_boundary_V", 0.0)) * L_boundary_V
         )
 
         L_total.backward()
@@ -386,6 +399,7 @@ def train_pinn(
                     "L_smooth": float(L_smooth.detach().cpu()),
                     "L_friction_reg": float(L_friction_reg.detach().cpu()),
                     "L_V_temporal": float(L_V_temporal.detach().cpu()),
+                    "L_boundary_V": float(L_boundary_V.detach().cpu()),
                     "a_minus_b_min": float(ab.min().detach().cpu()),
                     "a_minus_b_max": float(ab.max().detach().cpu()),
                     "a_minus_b_mean": float(ab.mean().detach().cpu()),
@@ -409,6 +423,7 @@ def train_pinn(
                     f"L_state={log_entry['L_state']:.2e} | "
                     f"L_freg={log_entry['L_friction_reg']:.2e} | "
                     f"L_Vt={log_entry['L_V_temporal']:.2e} | "
+                    f"L_bV={log_entry['L_boundary_V']:.2e} | "
                     f"(a-b)=[{log_entry['a_minus_b_min']:.4f},{log_entry['a_minus_b_max']:.4f}] "
                     f"mean={log_entry['a_minus_b_mean']:.4f} std={log_entry['a_minus_b_std']:.4f}"
                     ,
