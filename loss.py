@@ -163,19 +163,6 @@ def compute_L_ab_prior(
     )
 
 
-def compute_L_dc_prior(
-    D_c: Tensor,
-    dc_prior_mean: float = 0.02,
-    dc_prior_std: float = 0.01,
-) -> Tensor:
-    """Weak Gaussian prior on mean(D_c).
-
-    Prevents D_c from acting as free compensator for a, b, theta.
-    """
-    std = max(dc_prior_std, 1e-6)
-    return ((D_c.mean() - dc_prior_mean) / std).square()
-
-
 def compute_L_V_temporal(V_current: Tensor, V_other: Tensor) -> Tensor:
     """Penalize large temporal jumps in slip rate between two collocation times.
 
@@ -387,17 +374,20 @@ class PINNLoss:
             b_prior_std=b_prior_std,
         )
 
-    @staticmethod
-    def dc_prior(
-        D_c: Tensor,
-        dc_prior_mean: float = 0.02,
-        dc_prior_std: float = 0.01,
-    ) -> Tensor:
-        return compute_L_dc_prior(
-            D_c=D_c,
-            dc_prior_mean=dc_prior_mean,
-            dc_prior_std=dc_prior_std,
-        )
+    def smooth_dc(self, D_c: Tensor) -> Tensor:
+        """Spatial smoothness on D_c using neighbor edges."""
+        if self._edge_index_cpu.numel() == 0:
+            return torch.zeros((), dtype=D_c.dtype, device=D_c.device)
+
+        cache_key = str(D_c.device)
+        edge_index = self._edge_index_cache.get(cache_key)
+        if edge_index is None:
+            edge_index = self._edge_index_cpu.to(device=D_c.device, non_blocking=True)
+            self._edge_index_cache[cache_key] = edge_index
+
+        dc_flat = D_c.squeeze(-1)
+        diffs = dc_flat[edge_index[:, 0]] - dc_flat[edge_index[:, 1]]
+        return torch.mean(diffs.square())
 
     def boundary_V(self, V: Tensor, V_ref: float = 1e-9) -> Tensor:
         if self._boundary_weights is None:
